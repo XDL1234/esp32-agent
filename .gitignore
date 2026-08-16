@@ -1,0 +1,52 @@
+# Runtime state produced by the agentic tooling
+.esp-agent/
+*.pid
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# SVD parser cache
+.svd_cache/
+
+# ESP-IDF build output
+build/
+sdkconfig.old
+dependencies.lock
+managed_components/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local env
+.env
+.venv/
+venv/
+
+# Local agent settings and bundled third-party skills are not distributed.
+.claude/
+Skills/*
+!Skills/esp32-agent/
+!Skills/esp32-agent/**
+
+# Historical SVDs for targets not exposed by the current CLI.
+agentic/chips/esp32.svd
+agentic/chips/esp32c2.svd
+agentic/chips/esp32c6-lp.svd
+agentic/chips/esp32s2.svd
+agentic/chips/esp32s2-ulp.svd
+agentic/chips/esp32s3-ulp.svd
+
+# Legacy local templates and diagrams are not used by the installer.
+templates/CLAUDE.md
+templates/AGENTS.md
+docs/esp-agentic-architecture.pdf
+docs/esp-agentic-architecture.svg

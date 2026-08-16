@@ -1,0 +1,52 @@
+{
+  "name": "ESP32-P4",
+  "arch": "riscv32",
+  "svd": "chips/esp32p4.svd",
+  "memory": {
+    "flash_mapped": {
+      "start": "0x40000000",
+      "size":  "0x4000000",
+      "description": "Flash (memory-mapped, instruction/data bus)"
+    },
+    "psram": {
+      "start": "0x48000000",
+      "size":  "0x4000000",
+      "description": "External PSRAM (memory-mapped)"
+    },
+    "sram": {
+      "start": "0x4FF00000",
+      "size":  "0xC0000",
+      "description": "Internal SRAM (data/instruction bus)"
+    },
+    "lp_ram": {
+      "start": "0x50108000",
+      "size":  "0x8000",
+      "description": "LP (RTC) SRAM"
+    },
+    "lp_rom": {
+      "start": "0x50100000",
+      "size":  "0x4000",
+      "description": "LP (RTC) ROM (read-only)"
+    },
+    "rom_mask": {
+      "start": "0x4FC00000",
+      "size":  "0x20000",
+      "description": "Internal ROM (mask ROM)"
+    },
+    "peripherals_hp": {
+      "start": "0x50000000",
+      "size":  "0x100000",
+      "description": "HP peripheral registers"
+    },
+    "peripherals_lp": {
+      "start": "0x50110000",
+      "size":  "0x20000",
+      "description": "LP peripheral registers"
+    },
+    "cpu_peripherals": {
+      "start": "0x3FF00000",
+      "size":  "0x20000",
+      "description": "CPU peripheral registers"
+    }
+  }
+}

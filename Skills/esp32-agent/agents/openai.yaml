@@ -1,0 +1,7 @@
+interface:
+  display_name: "esp32-agent"
+  short_description: "Build, flash, inspect, and debug ESP32 firmware"
+  default_prompt: "Use $esp32-agent to inspect this ESP-IDF project and continue its hardware development workflow."
+
+policy:
+  allow_implicit_invocation: true

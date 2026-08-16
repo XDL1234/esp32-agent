@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+VERSION="0.1.0"
+REPO_DIR="${ESP32_AGENT_REPO_DIR:-${ESP32_AGENT_HOME:-$HOME/.local/share/esp32-agent}/repo}"
+
+info() { printf '[esp32-agent] %s\n' "$*"; }
+die() { printf '[esp32-agent] ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+esp32-agent - ESP-IDF hardware development for Claude Code and Codex
+
+Usage:
+  esp32-agent init [options]     Initialize or update the current project
+  esp32-agent start              Start the project's OpenOCD session
+  esp32-agent stop               Stop the project's OpenOCD session
+  esp32-agent doctor             Check the local ESP-IDF environment
+  esp32-agent update             Update esp32-agent and both installed skills
+  esp32-agent version            Print the installed version
+
+Init options:
+  --project DIR                  ESP-IDF project directory (default: current)
+  --chip CHIP                    esp32c3, esp32c6, esp32h2, esp32s3, esp32p4
+  --flash METHOD                 jtag or serial
+  --board BOARD                  generic, codecell-c3, waveshare-esp32c6,
+                                 esp32p4-function-ev
+  --force                        Replace an existing project configuration
+EOF
+}
+
+require_repo() {
+    [ -d "$REPO_DIR/agentic" ] || die "Runtime repository not found at $REPO_DIR. Reinstall esp32-agent."
+}
+
+python_command() {
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' python3
+    elif command -v python >/dev/null 2>&1; then
+        printf '%s\n' python
+    else
+        die "Python 3 is required. Activate the ESP-IDF environment first."
+    fi
+}
+
+choose_chip() {
+    local choice
+    printf '%s\n' "Select target chip:" >&2
+    printf '%s\n' "  1) ESP32-C3  2) ESP32-C6  3) ESP32-H2  4) ESP32-S3  5) ESP32-P4" >&2
+    if [ -r /dev/tty ]; then
+        read -r -p "Choice [1-5]: " choice < /dev/tty || die "Use --chip when no interactive terminal is available."
+    elif [ -t 0 ]; then
+        read -r -p "Choice [1-5]: " choice
+    else
+        die "Use --chip when running init non-interactively."
+    fi
+    case "$choice" in
+        1) printf '%s\n' esp32c3 ;;
+        2) printf '%s\n' esp32c6 ;;
+        3) printf '%s\n' esp32h2 ;;
+        4) printf '%s\n' esp32s3 ;;
+        5) printf '%s\n' esp32p4 ;;
+        *) die "Invalid chip choice: $choice" ;;
+    esac
+}
+
+default_flash() {
+    [ "$1" = esp32p4 ] && printf '%s\n' serial || printf '%s\n' jtag
+}
+
+board_source() {
+    case "$1" in
+        generic) printf '%s\n' "$REPO_DIR/boards/generic.md" ;;
+        codecell-c3) printf '%s\n' "$REPO_DIR/boards/codecell_c3.md" ;;
+        waveshare-esp32c6) printf '%s\n' "$REPO_DIR/boards/waveshare_esp32c6.md" ;;
+        esp32p4-function-ev) printf '%s\n' "$REPO_DIR/boards/esp32p4_function_ev_board.md" ;;
+        *) die "Unsupported board: $1" ;;
+    esac
+}
+
+validate_board_chip() {
+    case "$1:$2" in
+        generic:*|codecell-c3:esp32c3|waveshare-esp32c6:esp32c6|esp32p4-function-ev:esp32p4) ;;
+        *) die "Board '$1' does not match chip '$2'. Use --board generic for other boards." ;;
+    esac
+}
+
+upsert_instructions() {
+    local file="$1"
+    local py="$2"
+    "$py" - "$file" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+start = "<!-- esp32-agent:start -->"
+end = "<!-- esp32-agent:end -->"
+block_lf = """<!-- esp32-agent:start -->
+## esp32-agent
+
+Use the installed `esp32-agent` Skill for ESP-IDF build, flash, logging, inspection, and hardware debugging tasks. Before board-specific changes, read `agentic/esp_target_config.json` and `agentic/board.md`. Run `esp32-agent doctor` before the first hardware operation in a session.
+<!-- esp32-agent:end -->"""
+
+raw = path.read_bytes() if path.exists() else b""
+newline = "\r\n" if b"\r\n" in raw else "\n"
+text = raw.decode("utf-8")
+block = block_lf.replace("\n", newline)
+pattern = re.compile(re.escape(start) + r".*?" + re.escape(end), re.DOTALL)
+if pattern.search(text):
+    text = pattern.sub(block, text)
+else:
+    text = text.rstrip("\r\n")
+    text = f"{text}{newline}{newline}{block}" if text else block
+path.write_bytes((text.rstrip("\r\n") + newline).encode("utf-8"))
+PY
+}
+
+cmd_init() {
+    require_repo
+
+    local project="$(pwd)"
+    local chip=""
+    local flash=""
+    local board="generic"
+    local board_set=0
+    local force=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --project) [ $# -ge 2 ] || die "--project requires a directory"; project="$2"; shift 2 ;;
+            --chip) [ $# -ge 2 ] || die "--chip requires a value"; chip="$2"; shift 2 ;;
+            --flash) [ $# -ge 2 ] || die "--flash requires a value"; flash="$2"; shift 2 ;;
+            --board) [ $# -ge 2 ] || die "--board requires a value"; board="$2"; board_set=1; shift 2 ;;
+            --force) force=1; shift ;;
+            -h|--help) usage; return ;;
+            *) die "Unknown init option: $1" ;;
+        esac
+    done
+
+    [ -d "$project" ] || die "Project directory not found: $project"
+    project="$(cd "$project" && pwd)"
+    [ -f "$project/CMakeLists.txt" ] || die "$project is not an ESP-IDF project (CMakeLists.txt not found)."
+    local config="$project/agentic/esp_target_config.json"
+    local py
+    py="$(python_command)"
+
+    if [ -f "$config" ] && [ "$force" -eq 0 ]; then
+        local existing
+        existing="$($py - "$config" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+d = json.loads(p.read_text(encoding="utf-8"))
+print(Path(d.get("chip", "")).stem)
+print(d.get("flash", {}).get("method", "jtag"))
+PY
+)"
+        local existing_chip existing_flash
+        existing_chip="$(printf '%s\n' "$existing" | sed -n '1p')"
+        existing_flash="$(printf '%s\n' "$existing" | sed -n '2p')"
+        [ -z "$chip" ] || [ "$chip" = "$existing_chip" ] || die "Project uses $existing_chip; use --force to change the chip."
+        [ -z "$flash" ] || [ "$flash" = "$existing_flash" ] || die "Project uses $existing_flash; use --force to change the flash method."
+        chip="$existing_chip"
+        flash="$existing_flash"
+        info "Existing configuration found; preserving it while updating tools."
+    fi
+
+    if [ -z "$chip" ]; then
+        chip="$(choose_chip)"
+    fi
+    case "$chip" in esp32c3|esp32c6|esp32h2|esp32s3|esp32p4) ;; *) die "Unsupported chip: $chip" ;; esac
+    flash="${flash:-$(default_flash "$chip")}"
+    case "$flash" in jtag|serial) ;; *) die "Unsupported flash method: $flash" ;; esac
+    validate_board_chip "$board" "$chip"
+
+    local template="$REPO_DIR/templates/configs/$chip.json"
+    local board_file
+    board_file="$(board_source "$board")"
+    [ -f "$template" ] || die "Missing config template: $template"
+    [ -f "$board_file" ] || die "Missing board description: $board_file"
+
+    mkdir -p "$project/agentic/chips"
+    local file
+    for file in esp_target.py rtt_reader.py svd_parser.py esp-session-start.sh esp-session-stop.sh idf_build.sh SEGGER_RTT_Conf.h SEGGER_RTT.c SEGGER_RTT.h SEGGER_RTT_printf.c; do
+        cp "$REPO_DIR/agentic/$file" "$project/agentic/$file"
+    done
+    chmod +x "$project/agentic/"*.sh
+    cp "$REPO_DIR/agentic/chips/$chip.json" "$project/agentic/chips/$chip.json"
+    [ ! -f "$REPO_DIR/agentic/chips/$chip.svd" ] || cp "$REPO_DIR/agentic/chips/$chip.svd" "$project/agentic/chips/$chip.svd"
+    if [ ! -f "$project/agentic/board.md" ] || [ "$force" -eq 1 ] || [ "$board_set" -eq 1 ]; then
+        cp "$board_file" "$project/agentic/board.md"
+    fi
+
+    if [ ! -f "$config" ] || [ "$force" -eq 1 ]; then
+        cp "$template" "$config"
+        "$py" - "$config" "$flash" <<'PY'
+import json, platform, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+system = platform.system().lower()
+data["platform"] = "windows" if system == "windows" else ("macos" if system == "darwin" else "linux")
+data.setdefault("flash", {})["method"] = sys.argv[2]
+if sys.argv[2] == "serial":
+    data["flash"].setdefault("serial", {
+        "port": "auto", "baud": 460800, "flash_mode": "dio",
+        "flash_freq": "40m", "flash_size": "keep"
+    })
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+    fi
+
+    upsert_instructions "$project/CLAUDE.md" "$py"
+    upsert_instructions "$project/AGENTS.md" "$py"
+
+    info "Initialized $project"
+    info "Chip: $chip | flash: $flash | board: $board"
+    info "Review agentic/board.md, then run: esp32-agent doctor"
+}
+
+project_script() {
+    local name="$1"
+    local script="$(pwd)/agentic/$name"
+    [ -f "$script" ] || die "Not an initialized esp32-agent project: $(pwd)"
+    exec bash "$script"
+}
+
+cmd_doctor() {
+    local failures=0
+    local command
+    for command in git "$(python_command)"; do
+        if command -v "$command" >/dev/null 2>&1; then
+            info "OK: $command"
+        else
+            info "MISSING: $command"
+            failures=$((failures + 1))
+        fi
+    done
+    if [ -n "${IDF_PATH:-}" ] && [ -f "$IDF_PATH/tools/idf.py" ]; then
+        info "OK: ESP-IDF at $IDF_PATH"
+    else
+        info "MISSING: active ESP-IDF environment (IDF_PATH)"
+        failures=$((failures + 1))
+    fi
+    if command -v openocd >/dev/null 2>&1; then
+        info "OK: openocd"
+    else
+        info "MISSING: openocd in PATH"
+        failures=$((failures + 1))
+    fi
+    if [ -f "agentic/esp_target_config.json" ]; then
+        info "OK: project configuration"
+    else
+        info "MISSING: project configuration; run esp32-agent init"
+        failures=$((failures + 1))
+    fi
+    [ "$failures" -eq 0 ] || exit 1
+}
+
+cmd_update() {
+    require_repo
+    [ -d "$REPO_DIR/.git" ] || die "Installed repository is not a Git checkout. Reinstall esp32-agent."
+    git -C "$REPO_DIR" pull --ff-only
+    exec bash "$REPO_DIR/install.sh" --reuse
+}
+
+case "${1:-}" in
+    init) shift; cmd_init "$@" ;;
+    start) shift; [ $# -eq 0 ] || die "start takes no arguments"; project_script esp-session-start.sh ;;
+    stop) shift; [ $# -eq 0 ] || die "stop takes no arguments"; project_script esp-session-stop.sh ;;
+    doctor) shift; [ $# -eq 0 ] || die "doctor takes no arguments"; cmd_doctor ;;
+    update) shift; [ $# -eq 0 ] || die "update takes no arguments"; cmd_update ;;
+    version|--version|-V) printf 'esp32-agent %s\n' "$VERSION" ;;
+    help|--help|-h|"") usage ;;
+    *) die "Unknown command: $1. Run 'esp32-agent help'." ;;
+esac

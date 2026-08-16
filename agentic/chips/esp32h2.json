@@ -1,0 +1,32 @@
+{
+  "name": "ESP32-H2",
+  "arch": "riscv32",
+  "svd": "chips/esp32h2.svd",
+  "memory": {
+    "rom": {
+      "start": "0x40000000",
+      "size":  "0x20000",
+      "description": "Internal ROM (128KB)"
+    },
+    "sram": {
+      "start": "0x40800000",
+      "size":  "0x50000",
+      "description": "HP SRAM (320KB)"
+    },
+    "flash": {
+      "start": "0x42000000",
+      "size":  "0x400000",
+      "description": "Flash (memory-mapped, read-only)"
+    },
+    "lp_sram": {
+      "start": "0x50000000",
+      "size":  "0x1000",
+      "description": "LP SRAM (4KB)"
+    },
+    "peripherals": {
+      "start": "0x60000000",
+      "size":  "0xD0000",
+      "description": "Peripheral registers"
+    }
+  }
+}

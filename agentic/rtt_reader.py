@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""
+rtt_reader.py — SEGGER RTT reader over OpenOCD Tcl interface.
+
+Discovers the RTT control block in target SRAM, then polls the
+ring buffers and streams output to stdout or a log file.
+
+Uses mdw/mww commands over the Tcl port — works with any OpenOCD
+build, including Espressif's fork which lacks native RTT support.
+
+Runs as a long-lived daemon alongside OpenOCD.
+
+Usage:
+    python3 rtt_reader.py [options]
+    python3 rtt_reader.py --output .esp-agent/rtt.log
+    python3 rtt_reader.py --elf build/project.elf --output .esp-agent/rtt.log
+    python3 rtt_reader.py --elf build/project.elf --output .esp-agent/rtt.log --kill-existing --daemonize
+"""
+
+import os
+import atexit
+import socket
+import struct
+import time
+import sys
+import json
+import argparse
+import signal
+import subprocess
+from pathlib import Path
+
+
+class OpenOCDError(Exception):
+    pass
+
+
+class OpenOCDConnection:
+    """Persistent Tcl connection to OpenOCD."""
+
+    TCL_DELIMITER = b'\x1a'
+
+    def __init__(self, host='localhost', port=6666, timeout=30):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.sock = None
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self.host, self.port), timeout=self.timeout
+        )
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+
+    def command(self, cmd):
+        try:
+            self.sock.sendall((cmd + '\x1a').encode())
+            buf = b''
+            while not buf.endswith(self.TCL_DELIMITER):
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise OpenOCDError("Connection closed")
+                buf += chunk
+            return buf[:-1].decode(errors='replace').strip()
+        except OpenOCDError:
+            raise
+        except (socket.timeout, OSError) as e:
+            raise OpenOCDError(f"Socket error: {e}") from e
+
+    def read_memory(self, addr, count):
+        """Read count 32-bit words, return list of ints.
+        Breaks large reads into batches to avoid Tcl response issues."""
+        MAX_WORDS_PER_READ = 64  # 256 bytes per read — benchmark sweet spot
+        values = []
+        remaining = count
+        cur_addr = addr
+        while remaining > 0:
+            n = min(remaining, MAX_WORDS_PER_READ)
+            resp = self.command(f'mdw {cur_addr:#x} {n}')
+            for line in resp.splitlines():
+                if ':' in line:
+                    hex_part = line.split(':', 1)[1].strip()
+                    for token in hex_part.split():
+                        try:
+                            values.append(int(token, 16))
+                        except ValueError:
+                            pass
+            cur_addr += n * 4
+            remaining -= n
+        if len(values) < count:
+            raise OpenOCDError(
+                f"read_memory at {addr:#x}: expected {count} words, got {len(values)}"
+            )
+        return values
+
+    def read_bytes(self, addr, nbytes):
+        """Read raw bytes from target memory."""
+        # Read word-aligned, then slice
+        word_addr = addr & ~3
+        prefix = addr - word_addr
+        nwords = (prefix + nbytes + 3) // 4
+        words = self.read_memory(word_addr, nwords)
+        raw = struct.pack(f'<{len(words)}I', *words)
+        return raw[prefix:prefix + nbytes]
+
+    def write_u32(self, addr, value):
+        self.command(f'mww {addr:#x} {value:#x}')
+
+
+# ── RTT control block structures ──────────────────────
+
+RTT_MAGIC = b'SEGGER RTT\x00\x00\x00\x00\x00\x00'  # 16 bytes, null-padded
+RTT_CB_HEADER_SIZE = 24  # 16 magic + 4 MaxNumUpBuffers + 4 MaxNumDownBuffers
+RTT_BUFFER_DESC_SIZE = 24  # name_ptr(4) + buf_ptr(4) + size(4) + WrOff(4) + RdOff(4) + flags(4)
+
+
+class RTTChannel:
+    """Represents one RTT up-channel (target → host)."""
+
+    def __init__(self, index, desc_addr, name_ptr, buf_ptr, buf_size, wr_off, rd_off, flags):
+        self.index = index
+        self.desc_addr = desc_addr
+        self.name_ptr = name_ptr
+        self.buf_ptr = buf_ptr
+        self.buf_size = buf_size
+        self.wr_off = wr_off
+        self.rd_off = rd_off
+        self.flags = flags
+        self.name = None  # resolved later
+
+    def __repr__(self):
+        name = self.name or f"ch{self.index}"
+        return f"RTTChannel({name}, buf={self.buf_ptr:#x}, size={self.buf_size}, wr={self.wr_off}, rd={self.rd_off})"
+
+
+class RTTReader:
+    """Discovers and polls RTT channels over OpenOCD."""
+
+    def __init__(self, ocd, search_start, search_size,
+                 block_id="SEGGER RTT", poll_interval=0.05):
+        self.ocd = ocd
+        self.search_start = search_start
+        self.search_size = search_size
+        self.block_id = block_id
+        self.poll_interval = poll_interval
+        self.cb_addr = None
+        self.up_channels = []
+        self.down_channels = []
+
+    def find_control_block(self):
+        """Scan SRAM for the RTT control block magic signature."""
+        magic = self.block_id.encode('ascii')
+        # Pad to 16 bytes
+        magic = magic + b'\x00' * (16 - len(magic))
+
+        addr = self.search_start
+        end = self.search_start + self.search_size
+        chunk_words = 256  # 1KB per chunk
+        chunk_bytes = chunk_words * 4
+        overlap = 16  # overlap to catch magic spanning chunks
+        total = end - addr
+        last_pct_reported = -10
+
+        log(f"Scanning for RTT control block '{self.block_id}' "
+            f"in {self.search_start:#x}–{end:#x} ({total // 1024}KB)...")
+
+        while addr < end:
+            nwords = min(chunk_words, (end - addr + 3) // 4)
+            try:
+                words = self.ocd.read_memory(addr, nwords)
+            except OpenOCDError as e:
+                log(f"  Read error at {addr:#x}: {e}")
+                addr += chunk_bytes - overlap
+                continue
+
+            data = struct.pack(f'<{len(words)}I', *words)
+            idx = data.find(magic)
+            if idx >= 0:
+                self.cb_addr = addr + idx
+                log(f"  Found control block at {self.cb_addr:#x}")
+                return self.cb_addr
+
+            addr += chunk_bytes - overlap
+            pct = (addr - self.search_start) * 100 // total
+            if pct >= last_pct_reported + 10:
+                last_pct_reported = pct
+                log(f"  {pct}% scanned...")
+
+        log("  Control block not found.")
+        return None
+
+    def wait_for_init(self, timeout=30.0, interval=0.1):
+        """Block until the RTT magic is present at cb_addr, or raise OpenOCDError."""
+        import time, struct
+        deadline = time.monotonic() + timeout
+        last_log = 0
+        while True:
+            try:
+                words = self.ocd.read_memory(self.cb_addr, 4)
+                raw = b''.join(struct.pack('<I', w) for w in words)
+                now = time.monotonic()
+                if now - last_log > 2.0:
+                    log(f"  cb[0:16]={raw[:16].hex()}")
+                    last_log = now
+                if raw[:10] == b'SEGGER RTT':
+                    return
+            except OpenOCDError as e:
+                log(f"  read error: {e}")
+            if time.monotonic() > deadline:
+                raise OpenOCDError("Timed out waiting for RTT control block initialization")
+            time.sleep(interval)
+
+    def read_channel_descriptors(self):
+        """Parse the control block header and channel descriptors."""
+        if self.cb_addr is None:
+            raise OpenOCDError("Control block not found")
+
+        # Read header: 16 bytes magic + MaxNumUpBuffers(4) + MaxNumDownBuffers(4)
+        header_words = self.ocd.read_memory(self.cb_addr + 16, 2)
+        num_up = header_words[0]
+        num_down = header_words[1]
+
+        # Sanity check: reject garbage values
+        if num_up > 64 or num_down > 64:
+            raise OpenOCDError(f"Implausible channel counts: up={num_up} down={num_down}")
+
+        log(f"  Up channels: {num_up}, Down channels: {num_down}")
+
+        # Parse up-channel descriptors
+        self.up_channels = []
+        desc_base = self.cb_addr + RTT_CB_HEADER_SIZE
+
+        for i in range(num_up):
+            desc_addr = desc_base + i * RTT_BUFFER_DESC_SIZE
+            words = self.ocd.read_memory(desc_addr, 6)
+            ch = RTTChannel(
+                index=i,
+                desc_addr=desc_addr,
+                name_ptr=words[0],
+                buf_ptr=words[1],
+                buf_size=words[2],
+                wr_off=words[3],
+                rd_off=words[4],
+                flags=words[5],
+            )
+            # Try to read channel name
+            if ch.name_ptr != 0:
+                try:
+                    name_bytes = self.ocd.read_bytes(ch.name_ptr, 32)
+                    null_idx = name_bytes.find(b'\x00')
+                    if null_idx >= 0:
+                        name_bytes = name_bytes[:null_idx]
+                    ch.name = name_bytes.decode('ascii', errors='replace')
+                except OpenOCDError:
+                    ch.name = f"ch{i}"
+            log(f"  Up[{i}]: {ch}")
+            self.up_channels.append(ch)
+
+        # Parse down-channel descriptors (after up channels)
+        self.down_channels = []
+        desc_base = self.cb_addr + RTT_CB_HEADER_SIZE + num_up * RTT_BUFFER_DESC_SIZE
+
+        for i in range(num_down):
+            desc_addr = desc_base + i * RTT_BUFFER_DESC_SIZE
+            words = self.ocd.read_memory(desc_addr, 6)
+            ch = RTTChannel(
+                index=i,
+                desc_addr=desc_addr,
+                name_ptr=words[0],
+                buf_ptr=words[1],
+                buf_size=words[2],
+                wr_off=words[3],
+                rd_off=words[4],
+                flags=words[5],
+            )
+            self.down_channels.append(ch)
+
+        return self.up_channels
+
+    def poll_channel(self, channel):
+        """Read new data from an up-channel. Returns bytes."""
+        # Re-read the write offset from target (it changes as firmware writes)
+        wr_off_addr = channel.desc_addr + 12  # offset of WrOff in descriptor
+        wr_words = self.ocd.read_memory(wr_off_addr, 1)
+        wr_off = wr_words[0]
+
+        rd_off = channel.rd_off
+
+        if wr_off == rd_off:
+            return b''
+
+        # Calculate how much data to read
+        if wr_off > rd_off:
+            # Contiguous region
+            nbytes = wr_off - rd_off
+            data = self.ocd.read_bytes(channel.buf_ptr + rd_off, nbytes)
+        else:
+            # Wrapped: read tail, then head
+            tail_len = channel.buf_size - rd_off
+            head_len = wr_off
+            data = b''
+            if tail_len > 0:
+                data += self.ocd.read_bytes(channel.buf_ptr + rd_off, tail_len)
+            if head_len > 0:
+                data += self.ocd.read_bytes(channel.buf_ptr, head_len)
+
+        # Update read offset on the target so firmware knows space is free
+        rd_off_addr = channel.desc_addr + 16  # offset of RdOff in descriptor
+        self.ocd.write_u32(rd_off_addr, wr_off)
+        channel.rd_off = wr_off
+
+        return data
+
+    def stream(self, channel_index=0, output=None):
+        """Continuously poll a channel and write output.
+
+        output: file-like object (default: sys.stdout.buffer)
+        """
+        if channel_index >= len(self.up_channels):
+            raise OpenOCDError(
+                f"Channel {channel_index} not available "
+                f"(only {len(self.up_channels)} up-channels)"
+            )
+
+        ch = self.up_channels[channel_index]
+        out = output or sys.stdout.buffer
+
+        log(f"Streaming channel {channel_index} ({ch.name or 'unnamed'}), "
+            f"poll interval {self.poll_interval * 1000:.0f}ms")
+
+        # Sync: set our local rd_off to the current target value
+        rd_words = self.ocd.read_memory(ch.desc_addr + 16, 1)
+        ch.rd_off = rd_words[0]
+
+        while True:
+            try:
+                data = self.poll_channel(ch)
+                if data:
+                    out.write(data)
+                    out.flush()
+                else:
+                    time.sleep(self.poll_interval)
+            except OpenOCDError as e:
+                log(f"Connection error: {e}, reconnecting...")
+                time.sleep(1)
+                try:
+                    self.ocd.close()
+                    self.ocd.connect()
+                    log("Reconnected.")
+                    # Re-sync rd_off: target may have reset (e.g. woke from deep
+                    # sleep), so its WrOff/RdOff are back at 0.  Reading the
+                    # target's current RdOff prevents consuming stale/garbage data.
+                    rd_words = self.ocd.read_memory(ch.desc_addr + 16, 1)
+                    ch.rd_off = rd_words[0]
+                except Exception:
+                    log("Reconnect failed, retrying...")
+                    time.sleep(2)
+            except KeyboardInterrupt:
+                log("Stopped.")
+                break
+
+
+def log(msg):
+    print(f"[rtt] {msg}", file=sys.stderr, flush=True)
+
+
+def address_from_elf(elf_path, nm_executable='nm'):
+    """Extract _SEGGER_RTT symbol address from an ELF file using nm."""
+    if not nm_executable:
+        nm_executable = 'nm'
+    try:
+        result = subprocess.run(
+            [nm_executable, elf_path],
+            capture_output=True, timeout=10,
+            text=False,
+        )
+        for line in result.stdout.decode('utf-8', errors='replace').splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and '_SEGGER_RTT' in parts[2]:
+                return int(parts[0], 16)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def _process_is_rtt_reader(pid, platform):
+    """Return whether pid currently belongs to an rtt_reader.py process."""
+    try:
+        if platform == 'windows':
+            result = subprocess.run(
+                [
+                    'powershell', '-NoProfile', '-Command',
+                    f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' "
+                    "-ErrorAction SilentlyContinue; if ($p) { $p.CommandLine }",
+                ],
+                capture_output=True, timeout=5, text=False,
+            )
+        else:
+            result = subprocess.run(
+                ['ps', '-p', str(pid), '-o', 'args='],
+                capture_output=True, timeout=5, text=False,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    command = result.stdout.decode('utf-8', errors='replace').lower()
+    return result.returncode == 0 and 'rtt_reader.py' in command
+
+
+def _kill_existing_readers(platform=None):
+    """Kill project-owned rtt_reader.py processes recorded by PID files."""
+    if not platform:
+        platform = 'windows' if sys.platform == 'win32' else 'linux'
+    my_pid = os.getpid()
+
+    # Try PID file (check multiple possible locations)
+    for pid_dir in [Path('.esp-agent'), Path(__file__).resolve().parent / '.esp-agent']:
+        pid_path = pid_dir / 'rtt_reader.pid'
+        if pid_path.exists():
+            try:
+                old_pid = int(pid_path.read_text().strip())
+                if old_pid != my_pid and _process_is_rtt_reader(old_pid, platform):
+                    if platform == 'windows':
+                        subprocess.run(
+                            ['taskkill', '/PID', str(old_pid), '/F'],
+                            capture_output=True, timeout=5)
+                    else:
+                        os.kill(old_pid, signal.SIGTERM)
+                    log(f"Killed existing rtt_reader (PID {old_pid}) via pidfile")
+                    time.sleep(0.3)
+                elif old_pid != my_pid:
+                    log(f"Ignoring stale RTT PID file for non-reader process {old_pid}")
+            except (ValueError, ProcessLookupError, PermissionError,
+                    OSError, subprocess.TimeoutExpired):
+                pass
+            finally:
+                try:
+                    pid_path.unlink()
+                except OSError:
+                    pass
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='RTT reader over OpenOCD Tcl interface',
+    )
+    parser.add_argument('--host', default='localhost',
+                        help='OpenOCD host (default: localhost)')
+    parser.add_argument('--port', type=int, default=None,
+                        help='OpenOCD Tcl port (default: from config or 6666)')
+    parser.add_argument('--channel', type=int, default=0,
+                        help='RTT up-channel index (default: 0)')
+    parser.add_argument('--poll', type=float, default=0.05,
+                        help='Poll interval in seconds (default: 0.05)')
+    parser.add_argument('--output', '-o',
+                        default=None,
+                        help='Output file (default: stdout)')
+    parser.add_argument('--config',
+                        help='Project config JSON (default: esp_target_config.json)')
+    parser.add_argument('--search-start', type=lambda x: int(x, 0),
+                        default=None,
+                        help='SRAM start address for control block search')
+    parser.add_argument('--search-size', type=lambda x: int(x, 0),
+                        default=None,
+                        help='Search range size in bytes')
+    parser.add_argument('--block-id', default='SEGGER RTT',
+                        help='RTT control block ID string')
+    parser.add_argument('--address', '-a', type=lambda x: int(x, 0),
+                        default=None,
+                        help='Known control block address (skips scan)')
+    parser.add_argument('--elf', '-e',
+                        help='ELF file to extract control block address from (skips scan)')
+    parser.add_argument('--scan-only', action='store_true',
+                        help='Find control block and print info, then exit')
+    parser.add_argument('--kill-existing', action='store_true',
+                        help='Stop the project-owned RTT reader before starting')
+    parser.add_argument('--daemonize', action='store_true',
+                        help='Fork into background and return immediately')
+    parser.add_argument('--rotate', action='store_true',
+                        help='Rotate previous log file instead of truncating (default: truncate)')
+
+    args = parser.parse_args()
+
+    if args.daemonize and not args.output:
+        parser.error("--daemonize requires --output (stdout is not available in background)")
+
+    # --- Resolve platform from config early ---
+    _cfg_path = args.config
+    if _cfg_path is None:
+        for _d in [Path('.'), Path(__file__).parent]:
+            _p = _d / 'esp_target_config.json'
+            if _p.exists():
+                _cfg_path = str(_p)
+                break
+    _platform = ''
+    tcl_port = args.port
+    if _cfg_path and Path(_cfg_path).exists():
+        with open(_cfg_path) as _f:
+            _early_cfg = json.load(_f)
+        _platform = _early_cfg.get('platform', '')
+        if tcl_port is None:
+            tcl_port = _early_cfg.get('openocd', {}).get('tcl_port', 6666)
+    if not _platform:
+        _platform = 'windows' if sys.platform == 'win32' else 'linux'
+
+    # --- Kill existing rtt_reader.py instances ---
+    if args.kill_existing:
+        _kill_existing_readers(platform=_platform)
+
+    # --- Daemonize: fork into background ---
+    if args.daemonize:
+        if _platform == 'windows':
+            # Windows: spawn a detached subprocess instead of fork
+            # Pre-check OpenOCD connectivity before spawning blind child
+            _pre_ocd = OpenOCDConnection(host=args.host, port=tcl_port or 6666)
+            try:
+                _pre_ocd.connect()
+                _pre_ocd.close()
+            except Exception as e:
+                log(f"Cannot connect to OpenOCD (pre-check): {e}")
+                sys.exit(1)
+
+            import subprocess as _sp
+            cmd = [sys.executable] + sys.argv
+            cmd.remove('--daemonize')
+            proc = _sp.Popen(
+                cmd,
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, stdin=_sp.DEVNULL,
+                creationflags=getattr(_sp, 'DETACHED_PROCESS', 0) |
+                              getattr(_sp, 'CREATE_NEW_PROCESS_GROUP', 0),
+                close_fds=True,
+            )
+            print(proc.pid)
+            sys.exit(0)
+        pid = os.fork()
+        if pid > 0:
+            # Parent: print child PID and exit
+            print(pid)
+            sys.exit(0)
+        # Child: detach from terminal
+        os.setsid()
+        # Redirect stdin/stdout/stderr to /dev/null (logs go to --output)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        os.dup2(devnull, 1)
+        # Keep stderr for log() unless redirected by caller
+        if not sys.stderr.isatty():
+            os.dup2(devnull, 2)
+        os.close(devnull)
+
+    # Write PID file
+    if args.output:
+        pid_path = Path(args.output).parent / 'rtt_reader.pid'
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(os.getpid()))
+
+        def remove_pid_file():
+            try:
+                if pid_path.read_text().strip() == str(os.getpid()):
+                    pid_path.unlink()
+            except OSError:
+                pass
+
+        atexit.register(remove_pid_file)
+
+    # Resolve config
+    search_start = args.search_start
+    search_size = args.search_size
+    # Reuse config path resolved earlier for platform detection
+    config_path = _cfg_path
+
+    if config_path and Path(config_path).exists():
+        with open(config_path) as f:
+            project_cfg = json.load(f)
+
+        # Resolve chip config for SRAM range
+        config_dir = Path(config_path).parent
+        chip_path = config_dir / project_cfg.get('chip', '')
+        if chip_path.exists():
+            with open(chip_path) as f:
+                chip = json.load(f)
+            sram = chip.get('memory', {}).get('sram', {})
+            if search_start is None and sram:
+                search_start = int(sram.get('start', '0x20000000'), 0)
+            if search_size is None and sram:
+                search_size = int(sram.get('size', '0x10000'), 0)
+
+        if tcl_port is None:
+            tcl_port = project_cfg.get('openocd', {}).get('tcl_port', 6666)
+
+        toolchain_prefix = project_cfg.get('toolchain', {}).get('prefix', '')
+        log(f"Config: {config_path}")
+    else:
+        toolchain_prefix = ''
+        if args.config:
+            log(f"Warning: config not found: {args.config}")
+
+
+    if search_start is None:
+        search_start = 0x20000000  # generic default
+    if search_size is None:
+        search_size = 0x10000
+    if tcl_port is None:
+        tcl_port = 6666
+
+    # Connect to OpenOCD
+    ocd = OpenOCDConnection(host=args.host, port=tcl_port)
+    try:
+        ocd.connect()
+    except Exception as e:
+        log(f"Cannot connect to OpenOCD at {args.host}:{tcl_port}: {e}")
+        sys.exit(1)
+
+    log(f"Connected to OpenOCD at {args.host}:{tcl_port}")
+
+    # Create reader
+    reader = RTTReader(
+        ocd,
+        search_start=search_start,
+        search_size=search_size,
+        block_id=args.block_id,
+        poll_interval=args.poll,
+    )
+
+    # Find control block
+    if args.address is not None:
+        reader.cb_addr = args.address
+        log(f"Using provided control block address: {args.address:#x}")
+    elif args.elf:
+        nm_exe = f'{toolchain_prefix}nm' if toolchain_prefix else None
+        addr = address_from_elf(args.elf, nm_executable=nm_exe)
+        if addr is None:
+            log(f"Could not find _SEGGER_RTT symbol in {args.elf}")
+            ocd.close()
+            sys.exit(1)
+        reader.cb_addr = addr
+        log(f"Control block address from ELF: {addr:#x}")
+    else:
+        cb_addr = reader.find_control_block()
+        if cb_addr is None:
+            log("RTT control block not found. Is the firmware running with RTT initialized?")
+            log("Hint: use --elf build/project.elf or --address 0x... to skip scanning.")
+            ocd.close()
+            sys.exit(1)
+
+    # Wait until the RTT control block is initialized (firmware may not have run yet)
+    if reader.cb_addr is not None:
+        log("Waiting for RTT control block to initialize...")
+        reader.wait_for_init(timeout=60.0)
+        log("RTT control block initialized.")
+
+    # Parse channels
+    reader.read_channel_descriptors()
+
+    if args.scan_only:
+        log("Scan complete.")
+        ocd.close()
+        return
+
+    # Open output
+    output = None
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.exists() and args.rotate:
+            mtime = output_path.stat().st_mtime
+            ts = time.strftime('%Y-%m-%dT%H-%M-%S', time.localtime(mtime))
+            rotated = output_path.with_name(
+                f"{output_path.stem}.{ts}{output_path.suffix}"
+            )
+            output_path.rename(rotated)
+            log(f"Rotated previous log to {rotated.name}")
+        # Default: truncate existing log
+        output = open(output_path, 'wb')
+        log(f"Writing to {output_path}")
+
+    # Handle SIGTERM gracefully
+    def handle_signal(signum, frame):
+        log("Terminated.")
+        if output:
+            output.close()
+        ocd.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    # Stream
+    try:
+        reader.stream(channel_index=args.channel, output=output)
+    finally:
+        if output:
+            output.close()
+        ocd.close()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[rtt] FATAL: {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        sys.exit(1)
